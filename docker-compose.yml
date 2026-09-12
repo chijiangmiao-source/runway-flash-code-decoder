@@ -1,0 +1,23 @@
+services:
+  api:
+    build: .
+    ports:
+      # Host port is overridable: API_PORT=9000 docker compose up api
+      - "${API_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8080/healthz"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 5s
+
+  # One-shot acceptance service: runs the black-box checks in ./acceptance
+  # against the live api container, then exits with the test result.
+  verify:
+    build: .
+    command: ["go", "test", "-count=1", "-v", "./acceptance/..."]
+    environment:
+      API_URL: "http://api:8080"
+    depends_on:
+      api:
+        condition: service_healthy

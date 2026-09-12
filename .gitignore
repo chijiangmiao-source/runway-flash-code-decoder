@@ -1,0 +1,11 @@
+# Build artifacts
+/api
+/morse-api
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Local environment overrides
+.env
