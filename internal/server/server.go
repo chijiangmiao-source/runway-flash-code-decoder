@@ -14,10 +14,12 @@ import (
 
 // decodeRequest is the JSON body of POST /decode: the alternating
 // light-on/light-off pulse durations, plus the optional integer-microsecond
-// size of one duration tick.
+// size of one duration tick. Both members are captured raw so an explicit
+// JSON null can be told apart from an omitted member: null is a type error,
+// while an omitted member keeps its default handling.
 type decodeRequest struct {
-	Durations  []int `json:"durations"`
-	TickMicros *int  `json:"tick_micros"`
+	Durations  json.RawMessage `json:"durations"`
+	TickMicros json.RawMessage `json:"tick_micros"`
 }
 
 // New builds the Gin engine with every route registered.
@@ -50,19 +52,16 @@ func decode(c *gin.Context) {
 		return
 	}
 
-	tickMicros := decoder.DefaultTickMicros
-	if req.TickMicros != nil {
-		tickMicros = *req.TickMicros
+	durations, ok := parseDurations(c, req.Durations)
+	if !ok {
+		return
 	}
-	if tickMicros < decoder.MinTickMicros || tickMicros > decoder.MaxTickMicros {
-		c.JSON(http.StatusBadRequest, gin.H{
-			"field": "tick_micros",
-			"error": "tick_micros must be between 1 and 1000000 microseconds, got " + strconv.Itoa(tickMicros),
-		})
+	tickMicros, ok := parseTickMicros(c, req.TickMicros)
+	if !ok {
 		return
 	}
 
-	result, err := decoder.Decode(req.Durations, tickMicros)
+	result, err := decoder.Decode(durations, tickMicros)
 	var scaleErr *decoder.ScaleError
 	if errors.As(err, &scaleErr) {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -86,6 +85,67 @@ func decode(c *gin.Context) {
 		return
 	}
 	c.JSON(http.StatusOK, result)
+}
+
+// parseDurations decodes the raw durations member into integer ticks. An
+// omitted member is left for the decoder to judge as an empty record, but
+// an explicit JSON null is not an integer array and is rejected like any
+// other non-array value. It reports whether the field is usable, having
+// written the 400 response itself when it is not.
+func parseDurations(c *gin.Context, raw json.RawMessage) ([]int, bool) {
+	if raw == nil {
+		return nil, true
+	}
+	if string(raw) == "null" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "durations",
+			"error": "durations must be an array of integers, got null",
+		})
+		return nil, false
+	}
+	var durations []int
+	if err := json.Unmarshal(raw, &durations); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "durations",
+			"error": "durations has an invalid JSON type: durations must be an array of integers",
+		})
+		return nil, false
+	}
+	return durations, true
+}
+
+// parseTickMicros decodes the optional raw tick_micros member, defaulting
+// an omitted member to the default scale. An explicit JSON null is not an
+// integer scale and is rejected like a fractional or non-numeric value. It
+// reports whether the field is usable, having written the 400 response
+// itself when it is not.
+func parseTickMicros(c *gin.Context, raw json.RawMessage) (int, bool) {
+	if raw == nil {
+		return decoder.DefaultTickMicros, true
+	}
+	if string(raw) == "null" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "tick_micros",
+			"error": "tick_micros must be an integer, got null",
+		})
+		return 0, false
+	}
+	var tickMicros int
+	if err := json.Unmarshal(raw, &tickMicros); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "tick_micros",
+			"error": "tick_micros has an invalid JSON type: tick_micros must be an integer",
+		})
+		return 0, false
+	}
+	if tickMicros < decoder.MinTickMicros || tickMicros > decoder.MaxTickMicros {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "tick_micros",
+			"error": "tick_micros must be between 1 and 1000000 microseconds, got " + strconv.Itoa(tickMicros),
+		})
+		return 0, false
+	}
+	return tickMicros, true
 }
 
 func jsonFieldName(field string) string {

@@ -108,6 +108,32 @@ func TestDecodeInvalidTickTypeReturns400WithField(t *testing.T) {
 	assert.Equal(t, "tick_micros", body["field"])
 }
 
+func TestDecodeNullTickReturns400WithField(t *testing.T) {
+	// An explicit null scale is not an integer and must not fall back to the
+	// default; only an omitted tick_micros member defaults.
+	w := post(t, `{"durations": [80, 80, 240], "tick_micros": null}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "tick_micros", body["field"])
+	assert.NotEmpty(t, body["error"])
+	assert.NotContains(t, body, "message")
+}
+
+func TestDecodeNullDurationsReturns400WithField(t *testing.T) {
+	// An explicit null array is a type error, not an empty record.
+	w := post(t, `{"durations": null}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "durations", body["field"])
+	assert.NotEmpty(t, body["error"])
+	assert.NotContains(t, body, "message")
+	assert.NotContains(t, body, "index")
+}
+
 func TestDecodeScaledOutOfRangePulseReturns422WithOriginalIndex(t *testing.T) {
 	// Doubled clean values with the light-off gap at index 7 left at 100.
 	// At 500µs/tick it is 50,000µs, below the first 80,000µs gap window.
@@ -132,6 +158,24 @@ func TestDecodeMultiplicationOverflowReturns400(t *testing.T) {
 	var response map[string]any
 	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
 	assert.Equal(t, "durations[1]", response["field"])
+}
+
+func TestDecodeOverflowOutranksEarlierInvalidPulse(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("integer JSON values on this platform cannot reach 64-bit microsecond overflow")
+	}
+
+	// Index 0 is a 50ms light-on pulse (outside every window), but the
+	// overflow at index 2 is a request-level error and must be reported
+	// instead of the earlier pulse-level failure.
+	w := post(t, `{"durations": [50, 100, 9223372036854775807]}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "durations[2]", body["field"])
+	assert.NotContains(t, body, "message")
+	assert.NotContains(t, body, "index")
 }
 
 func TestDecodeInvalidPulseReturns422WithFirstIndex(t *testing.T) {

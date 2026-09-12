@@ -143,6 +143,34 @@ func TestAcceptanceInvalidTickRejectedWith400(t *testing.T) {
 	}
 }
 
+func TestAcceptanceNullTickRejectedWith400(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// A valid record with an explicit null scale: null is not an integer
+	// tick and must not silently fall back to the default scale.
+	status, body := postDecode(t, base, map[string]any{
+		"durations":   []int{80, 80, 240},
+		"tick_micros": nil,
+	})
+	require.Equal(t, http.StatusBadRequest, status, "body: %v", body)
+	assert.Equal(t, "tick_micros", body["field"])
+	assert.NotContains(t, body, "message")
+}
+
+func TestAcceptanceNullDurationsRejectedWith400(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// An explicit null pulse array is a field type error, not an empty
+	// record: 400 with the field named, never a 422 decode failure.
+	status, body := postDecode(t, base, map[string]any{"durations": nil})
+	require.Equal(t, http.StatusBadRequest, status, "body: %v", body)
+	assert.Equal(t, "durations", body["field"])
+	assert.NotContains(t, body, "message")
+	assert.NotContains(t, body, "index")
+}
+
 func TestAcceptanceScaledOverflowRejectedWith400(t *testing.T) {
 	base := apiURL(t)
 	waitForAPI(t, base)
@@ -154,6 +182,22 @@ func TestAcceptanceScaledOverflowRejectedWith400(t *testing.T) {
 	require.Equal(t, http.StatusBadRequest, status, "body: %v", body)
 	assert.Equal(t, "durations[1]", body["field"])
 	assert.NotContains(t, body, "message")
+}
+
+func TestAcceptanceOverflowOutranksEarlierInvalidPulse(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// Index 0 is a 50ms light-on pulse (outside every window), but the
+	// request-level overflow at index 2 must be reported instead of the
+	// earlier pulse-level failure.
+	status, body := postDecode(t, base, map[string]any{
+		"durations": []int64{50, 100, math.MaxInt64},
+	})
+	require.Equal(t, http.StatusBadRequest, status, "body: %v", body)
+	assert.Equal(t, "durations[2]", body["field"])
+	assert.NotContains(t, body, "message")
+	assert.NotContains(t, body, "index")
 }
 
 func TestAcceptanceCorruptRecordStopsAtFirstAnomaly(t *testing.T) {

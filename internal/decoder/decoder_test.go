@@ -226,3 +226,20 @@ func TestDecodeMultiplicationOverflow(t *testing.T) {
 	require.ErrorAs(t, err, &scaleErr)
 	assert.Equal(t, "durations[2]", scaleErr.Field)
 }
+
+func TestDecodeOverflowOutranksEarlierInvalidPulse(t *testing.T) {
+	overflowing, err := strconv.ParseInt("9223372036854775807", 10, 64)
+	require.NoError(t, err)
+	if strconv.IntSize < 64 {
+		t.Skip("integer ticks on this platform cannot reach 64-bit microsecond overflow")
+	}
+
+	// Index 0 is below the dot window, but the overflow at index 2 is a
+	// request-level field error and takes priority over the pulse-level
+	// failure that would be found first left to right.
+	res, err := Decode([]int{50, 100, int(overflowing)}, DefaultTickMicros)
+	require.Nil(t, res)
+	var scaleErr *ScaleError
+	require.ErrorAs(t, err, &scaleErr)
+	assert.Equal(t, "durations[2]", scaleErr.Field)
+}

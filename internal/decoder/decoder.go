@@ -104,10 +104,14 @@ func (e *ScaleError) Error() string {
 // Decode validates durations and decodes them into Morse characters.
 //
 // Each duration is multiplied by tickMicros using integer arithmetic to
-// obtain its length in microseconds. Pulses are then checked strictly left
-// to right; a *Error always names the first offending original pulse index.
-// A character that is not in the supported table is reported at the index
-// of its first pulse. On error no partial message is produced.
+// obtain its length in microseconds. Every duration is scaled before any
+// pulse is classified, so an overflowing element is always reported as a
+// *ScaleError — a request-level failure that outranks pulse-level decoding
+// errors even when an earlier pulse would be rejected first. Pulses are
+// then checked strictly left to right; a *Error always names the first
+// offending original pulse index. A character that is not in the supported
+// table is reported at the index of its first pulse. On error no partial
+// message is produced.
 //
 // A *ScaleError is returned for an unsupported tick scale or integer
 // multiplication overflow, before a pulse can be classified as 422.
@@ -121,6 +125,18 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 
 	if len(durations) == 0 {
 		return nil, &Error{Index: 0, Reason: "record is empty: at least one light-on pulse is required"}
+	}
+
+	// Scale the whole record up front: a multiplication overflow anywhere in
+	// the request is a 400-level field error and takes priority over any
+	// pulse-level decoding failure.
+	scaled := make([]int64, len(durations))
+	for i, d := range durations {
+		micros, scaleErr := scaleDuration(i, d, tickMicros)
+		if scaleErr != nil {
+			return nil, scaleErr
+		}
+		scaled[i] = micros
 	}
 
 	var (
@@ -146,12 +162,7 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 		return nil
 	}
 
-	for i, d := range durations {
-		micros, scaleErr := scaleDuration(i, d, tickMicros)
-		if scaleErr != nil {
-			return nil, scaleErr
-		}
-
+	for i, micros := range scaled {
 		switch {
 		case micros <= 0:
 			return nil, &Error{Index: i, Reason: fmt.Sprintf("duration %s is not a positive integer", valueText(micros, tickMicros))}
