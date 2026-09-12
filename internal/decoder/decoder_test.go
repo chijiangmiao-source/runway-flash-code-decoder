@@ -1,6 +1,7 @@
 package decoder
 
 import (
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -113,7 +114,7 @@ func TestDecodeValidRecords(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res, decErr := Decode(tc.durations)
+			res, decErr := Decode(tc.durations, DefaultTickMicros)
 			require.Nil(t, decErr)
 			require.NotNil(t, res)
 			assert.Equal(t, tc.message, res.Message)
@@ -157,11 +158,71 @@ func TestDecodeInvalidRecords(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			res, decErr := Decode(tc.durations)
+			res, err := Decode(tc.durations, DefaultTickMicros)
 			require.Nil(t, res, "no partial result may be returned on error")
-			require.NotNil(t, decErr)
+			require.Error(t, err)
+			var decErr *Error
+			require.ErrorAs(t, err, &decErr)
 			assert.Equal(t, tc.wantIndex, decErr.Index)
 			assert.NotEmpty(t, decErr.Reason)
 		})
 	}
+}
+
+func TestDecodeWithTickScale(t *testing.T) {
+	millisecondSOS := []int{
+		80, 80, 80, 80, 80, // S
+		240,
+		240, 120, 240, 120, 240, // O
+		360,
+		120, 120, 120, 120, 120, // S
+	}
+
+	scaledSOS := make([]int, len(millisecondSOS))
+	for i, d := range millisecondSOS {
+		scaledSOS[i] = d * 2
+	}
+
+	defaultResult, err := Decode(millisecondSOS, DefaultTickMicros)
+	require.NoError(t, err)
+	scaledResult, err := Decode(scaledSOS, 500)
+	require.NoError(t, err)
+	assert.Equal(t, defaultResult, scaledResult)
+}
+
+func TestDecodeInvalidScale(t *testing.T) {
+	for _, tickMicros := range []int{0, -1, MaxTickMicros + 1} {
+		t.Run(strconv.Itoa(tickMicros), func(t *testing.T) {
+			res, err := Decode(nil, tickMicros)
+			require.Nil(t, res)
+			var scaleErr *ScaleError
+			require.ErrorAs(t, err, &scaleErr)
+			assert.Equal(t, "tick_micros", scaleErr.Field)
+		})
+	}
+}
+
+func TestDecodeScaledInvalidPulseReportsOriginalIndex(t *testing.T) {
+	// With 500µs ticks, [200,200,200] is a valid A; the unscaled 50 at
+	// index 2 becomes 25000µs, which is not a dash.
+	res, err := Decode([]int{200, 200, 50}, 500)
+	require.Nil(t, res)
+	var decErr *Error
+	require.ErrorAs(t, err, &decErr)
+	assert.Equal(t, 2, decErr.Index)
+	assert.Contains(t, decErr.Reason, "25000µs")
+}
+
+func TestDecodeMultiplicationOverflow(t *testing.T) {
+	overflowing, err := strconv.ParseInt("9223372036854775807", 10, 64)
+	require.NoError(t, err)
+	if strconv.IntSize < 64 {
+		t.Skip("integer ticks on this platform cannot reach 64-bit microsecond overflow")
+	}
+
+	res, err := Decode([]int{100, 100, int(overflowing)}, DefaultTickMicros)
+	require.Nil(t, res)
+	var scaleErr *ScaleError
+	require.ErrorAs(t, err, &scaleErr)
+	assert.Equal(t, "durations[2]", scaleErr.Field)
 }

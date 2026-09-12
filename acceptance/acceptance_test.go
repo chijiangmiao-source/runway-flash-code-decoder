@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"os"
 	"testing"
@@ -42,16 +43,21 @@ func waitForAPI(t *testing.T, base string) {
 	t.Fatalf("api at %s did not become healthy within 30s", base)
 }
 
-func postDurations(t *testing.T, base string, durations []int) (int, map[string]any) {
+func postDecode(t *testing.T, base string, payload map[string]any) (int, map[string]any) {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{"durations": durations})
+	data, err := json.Marshal(payload)
 	require.NoError(t, err)
-	resp, err := http.Post(base+"/decode", "application/json", bytes.NewReader(payload))
+	resp, err := http.Post(base+"/decode", "application/json", bytes.NewReader(data))
 	require.NoError(t, err)
 	defer resp.Body.Close()
 	var body map[string]any
 	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
 	return resp.StatusCode, body
+}
+
+func postDurations(t *testing.T, base string, durations []int) (int, map[string]any) {
+	t.Helper()
+	return postDecode(t, base, map[string]any{"durations": durations})
 }
 
 func TestAcceptanceValidRecordDecodesUniquely(t *testing.T) {
@@ -92,12 +98,87 @@ func TestAcceptanceValidRecordDecodesUniquely(t *testing.T) {
 	}
 }
 
+func TestAcceptance500MicrosecondTicksDecodeSameMessage(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	durations := []int{
+		160, 160, 160, 160, 160, // S: 80ms each at 500µs/tick
+		480,
+		480, 240, 480, 240, 480, // O: 240ms/120ms at 500µs/tick
+		720,
+		240, 240, 240, 240, 240, // S: 120ms each at 500µs/tick
+	}
+	status, body := postDecode(t, base, map[string]any{
+		"durations":   durations,
+		"tick_micros": 500,
+	})
+	require.Equal(t, http.StatusOK, status, "body: %v", body)
+	assert.Equal(t, "SOS", body["message"])
+
+	chars, ok := body["characters"].([]any)
+	require.True(t, ok, "characters must be an array: %v", body)
+	require.Len(t, chars, 3)
+	wantStarts := []float64{0, 6, 12}
+	wantEnds := []float64{4, 10, 16}
+	for i := range wantStarts {
+		c := chars[i].(map[string]any)
+		assert.Equal(t, wantStarts[i], c["start"])
+		assert.Equal(t, wantEnds[i], c["end"])
+	}
+}
+
+func TestAcceptanceInvalidTickRejectedWith400(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	for _, tickMicros := range []int{0, 1_000_001} {
+		status, body := postDecode(t, base, map[string]any{
+			"durations":   []int{100},
+			"tick_micros": tickMicros,
+		})
+		assert.Equal(t, http.StatusBadRequest, status, "tick_micros=%d body: %v", tickMicros, body)
+		assert.Equal(t, "tick_micros", body["field"])
+		assert.NotContains(t, body, "message")
+	}
+}
+
+func TestAcceptanceScaledOverflowRejectedWith400(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	status, body := postDecode(t, base, map[string]any{
+		"durations":   []int64{100, math.MaxInt64},
+		"tick_micros": 1000,
+	})
+	require.Equal(t, http.StatusBadRequest, status, "body: %v", body)
+	assert.Equal(t, "durations[1]", body["field"])
+	assert.NotContains(t, body, "message")
+}
+
 func TestAcceptanceCorruptRecordStopsAtFirstAnomaly(t *testing.T) {
 	base := apiURL(t)
 	waitForAPI(t, base)
 
 	// A clean S, a clean character gap, then a 50ms light-off at index 7.
 	status, body := postDurations(t, base, []int{100, 100, 100, 100, 100, 300, 100, 50, 100})
+	require.Equal(t, http.StatusUnprocessableEntity, status, "body: %v", body)
+	assert.Equal(t, float64(7), body["index"])
+	assert.NotEmpty(t, body["error"])
+	assert.NotContains(t, body, "message", "corrupt records must not leak a partial message")
+	assert.NotContains(t, body, "characters", "corrupt records must not leak partial characters")
+}
+
+func TestAcceptanceScaledOutOfRangePulseStopsAtOriginalIndex(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// A doubled clean S and character gap, with the light-off tick at index 7
+	// left undoubled: 100 × 500µs = 50,000µs, below the 80,000µs window.
+	status, body := postDecode(t, base, map[string]any{
+		"durations":   []int{200, 200, 200, 200, 200, 600, 200, 100, 200},
+		"tick_micros": 500,
+	})
 	require.Equal(t, http.StatusUnprocessableEntity, status, "body: %v", body)
 	assert.Equal(t, float64(7), body["index"])
 	assert.NotEmpty(t, body["error"])

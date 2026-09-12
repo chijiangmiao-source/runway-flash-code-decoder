@@ -2,13 +2,30 @@
 // durations exported by the runway threshold-light controller into the
 // Morse code message the equipment broadcast.
 //
-// A record is a slice of positive millisecond durations. It starts with a
+// A record is a slice of positive integer tick durations. It starts with a
 // light-on pulse, alternates light-off / light-on, and must end with a
-// light-on pulse (so its length is always odd). All timing windows are
-// closed intervals: both endpoints are valid.
+// light-on pulse (so its length is always odd). tickMicros gives the size
+// of one tick in integer microseconds; DefaultTickMicros makes each tick
+// one millisecond. All timing windows are closed intervals: both endpoints
+// are valid.
 package decoder
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+)
+
+const (
+	// MicrosecondsPerMillisecond is used to express millisecond windows in
+	// microseconds after tick scaling.
+	MicrosecondsPerMillisecond int64 = 1000
+
+	// DefaultTickMicros treats request durations as milliseconds.
+	DefaultTickMicros = 1000
+	// MinTickMicros and MaxTickMicros bound the optional request scale.
+	MinTickMicros = 1
+	MaxTickMicros = 1_000_000
+)
 
 // Timing windows in milliseconds. Every bound is inclusive.
 const (
@@ -21,6 +38,19 @@ const (
 	IntraMax = 120 // longest light-off gap inside one character
 	InterMin = 240 // shortest light-off gap between two characters
 	InterMax = 360 // longest light-off gap between two characters
+)
+
+// Timing windows in microseconds. Every bound is inclusive.
+const (
+	dotMinMicros  = int64(DotMin) * MicrosecondsPerMillisecond
+	dotMaxMicros  = int64(DotMax) * MicrosecondsPerMillisecond
+	dashMinMicros = int64(DashMin) * MicrosecondsPerMillisecond
+	dashMaxMicros = int64(DashMax) * MicrosecondsPerMillisecond
+
+	intraMinMicros = int64(IntraMin) * MicrosecondsPerMillisecond
+	intraMaxMicros = int64(IntraMax) * MicrosecondsPerMillisecond
+	interMinMicros = int64(InterMin) * MicrosecondsPerMillisecond
+	interMaxMicros = int64(InterMax) * MicrosecondsPerMillisecond
 )
 
 // patterns is the complete supported code table; anything else is an error.
@@ -49,7 +79,8 @@ type Result struct {
 	Characters []CharSpan `json:"characters"`
 }
 
-// Error pinpoints the first pulse that makes a record undecodable.
+// Error pinpoints the first pulse that makes a record undecodable after
+// tick durations have been scaled to microseconds.
 type Error struct {
 	Index  int    `json:"index"`
 	Reason string `json:"error"`
@@ -59,13 +90,35 @@ func (e *Error) Error() string {
 	return fmt.Sprintf("pulse %d: %s", e.Index, e.Reason)
 }
 
-// Decode validates durations and decodes it into Morse characters.
+// ScaleError identifies a request field that is invalid before or while
+// durations are scaled to microseconds. The HTTP layer maps it to 400.
+type ScaleError struct {
+	Field  string `json:"field"`
+	Reason string `json:"error"`
+}
+
+func (e *ScaleError) Error() string {
+	return fmt.Sprintf("%s: %s", e.Field, e.Reason)
+}
+
+// Decode validates durations and decodes them into Morse characters.
 //
-// Pulses are checked strictly left to right; the returned *Error always
-// names the first offending pulse index. A character that is not in the
-// supported table is reported at the index of its first pulse. On error no
-// partial message is produced.
-func Decode(durations []int) (*Result, *Error) {
+// Each duration is multiplied by tickMicros using integer arithmetic to
+// obtain its length in microseconds. Pulses are then checked strictly left
+// to right; a *Error always names the first offending original pulse index.
+// A character that is not in the supported table is reported at the index
+// of its first pulse. On error no partial message is produced.
+//
+// A *ScaleError is returned for an unsupported tick scale or integer
+// multiplication overflow, before a pulse can be classified as 422.
+func Decode(durations []int, tickMicros int) (*Result, error) {
+	if tickMicros < MinTickMicros || tickMicros > MaxTickMicros {
+		return nil, &ScaleError{
+			Field:  "tick_micros",
+			Reason: fmt.Sprintf("tick_micros must be between %d and %d microseconds, got %d", MinTickMicros, MaxTickMicros, tickMicros),
+		}
+	}
+
 	if len(durations) == 0 {
 		return nil, &Error{Index: 0, Reason: "record is empty: at least one light-on pulse is required"}
 	}
@@ -94,36 +147,54 @@ func Decode(durations []int) (*Result, *Error) {
 	}
 
 	for i, d := range durations {
+		micros, scaleErr := scaleDuration(i, d, tickMicros)
+		if scaleErr != nil {
+			return nil, scaleErr
+		}
+
 		switch {
-		case d <= 0:
-			return nil, &Error{Index: i, Reason: fmt.Sprintf("duration %dms is not a positive integer", d)}
+		case micros <= 0:
+			return nil, &Error{Index: i, Reason: fmt.Sprintf("duration %s is not a positive integer", valueText(micros, tickMicros))}
 		case i%2 == 0: // light-on pulse
 			switch {
-			case d >= DotMin && d <= DotMax:
+			case micros >= dotMinMicros && micros <= dotMaxMicros:
+				if len(pattern) == 0 {
+					charStart = i
+				}
 				pattern = append(pattern, '.')
-			case d >= DashMin && d <= DashMax:
+			case micros >= dashMinMicros && micros <= dashMaxMicros:
+				if len(pattern) == 0 {
+					charStart = i
+				}
 				pattern = append(pattern, '-')
 			default:
 				return nil, &Error{
-					Index:  i,
-					Reason: fmt.Sprintf("light-on duration %dms is neither a dot (%d-%dms) nor a dash (%d-%dms)", d, DotMin, DotMax, DashMin, DashMax),
+					Index: i,
+					Reason: fmt.Sprintf(
+						"light-on duration %s is neither a dot (%s) nor a dash (%s)",
+						valueText(micros, tickMicros),
+						rangeText(dotMinMicros, dotMaxMicros, tickMicros),
+						rangeText(dashMinMicros, dashMaxMicros, tickMicros),
+					),
 				}
-			}
-			if len(pattern) == 1 {
-				charStart = i
 			}
 		default: // light-off pulse
 			switch {
-			case d >= IntraMin && d <= IntraMax:
+			case micros >= intraMinMicros && micros <= intraMaxMicros:
 				// Gap inside the current character: keep collecting.
-			case d >= InterMin && d <= InterMax:
+			case micros >= interMinMicros && micros <= interMaxMicros:
 				if err := closeChar(i - 1); err != nil {
 					return nil, err
 				}
 			default:
 				return nil, &Error{
-					Index:  i,
-					Reason: fmt.Sprintf("light-off duration %dms is neither an intra-character gap (%d-%dms) nor an inter-character gap (%d-%dms)", d, IntraMin, IntraMax, InterMin, InterMax),
+					Index: i,
+					Reason: fmt.Sprintf(
+						"light-off duration %s is neither an intra-character gap (%s) nor an inter-character gap (%s)",
+						valueText(micros, tickMicros),
+						rangeText(intraMinMicros, intraMaxMicros, tickMicros),
+						rangeText(interMinMicros, interMaxMicros, tickMicros),
+					),
 				}
 			}
 		}
@@ -144,4 +215,42 @@ func Decode(durations []int) (*Result, *Error) {
 		message = append(message, c.Char...)
 	}
 	return &Result{Message: string(message), Characters: chars}, nil
+}
+
+func scaleDuration(index, duration, tickMicros int) (int64, *ScaleError) {
+	d := int64(duration)
+	tick := int64(tickMicros)
+
+	overflow := false
+	switch {
+	case d > 0 && d > math.MaxInt64/tick:
+		overflow = true
+	case d < 0 && d < math.MinInt64/tick:
+		overflow = true
+	}
+	if overflow {
+		return 0, &ScaleError{
+			Field: fmt.Sprintf("durations[%d]", index),
+			Reason: fmt.Sprintf(
+				"duration %d ticks × %d microseconds per tick overflows integer microseconds",
+				duration, tickMicros,
+			),
+		}
+	}
+
+	return d * tick, nil
+}
+
+func valueText(micros int64, tickMicros int) string {
+	if tickMicros == DefaultTickMicros {
+		return fmt.Sprintf("%dms", micros/MicrosecondsPerMillisecond)
+	}
+	return fmt.Sprintf("%dµs", micros)
+}
+
+func rangeText(min, max int64, tickMicros int) string {
+	if tickMicros == DefaultTickMicros {
+		return fmt.Sprintf("%d-%dms", min/MicrosecondsPerMillisecond, max/MicrosecondsPerMillisecond)
+	}
+	return fmt.Sprintf("%d-%dµs", min, max)
 }

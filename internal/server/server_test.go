@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -17,13 +18,18 @@ func newRouter() *gin.Engine {
 	return New()
 }
 
-func post(t *testing.T, body string) *httptest.ResponseRecorder {
+func postRaw(t *testing.T, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodPost, "/decode", bytes.NewBufferString(body))
 	req.Header.Set("Content-Type", "application/json")
 	w := httptest.NewRecorder()
 	newRouter().ServeHTTP(w, req)
 	return w
+}
+
+func post(t *testing.T, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postRaw(t, body)
 }
 
 func TestDecodeValidRecord(t *testing.T) {
@@ -51,6 +57,81 @@ func TestDecodeValidRecord(t *testing.T) {
 	assert.Equal(t, "S", body.Characters[2].Char)
 	assert.Equal(t, 12, body.Characters[2].Start)
 	assert.Equal(t, 16, body.Characters[2].End)
+}
+
+func TestDecodeWith500MicrosecondTicks(t *testing.T) {
+	w := post(t, `{"tick_micros": 500, "durations": [200,200,200,200,200, 600, 600,200,600,200,600, 600, 200,200,200,200,200]}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body struct {
+		Message    string `json:"message"`
+		Characters []struct {
+			Char  string `json:"char"`
+			Start int    `json:"start"`
+			End   int    `json:"end"`
+		} `json:"characters"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "SOS", body.Message)
+	require.Len(t, body.Characters, 3)
+	assert.Equal(t, "S", body.Characters[0].Char)
+	assert.Equal(t, 0, body.Characters[0].Start)
+	assert.Equal(t, 4, body.Characters[0].End)
+	assert.Equal(t, "O", body.Characters[1].Char)
+	assert.Equal(t, 6, body.Characters[1].Start)
+	assert.Equal(t, 10, body.Characters[1].End)
+	assert.Equal(t, "S", body.Characters[2].Char)
+	assert.Equal(t, 12, body.Characters[2].Start)
+	assert.Equal(t, 16, body.Characters[2].End)
+}
+
+func TestDecodeInvalidTickReturns400WithField(t *testing.T) {
+	for _, tickMicros := range []int{0, -1, 1_000_001} {
+		body := `{"durations": [], "tick_micros": ` + strconv.Itoa(tickMicros) + `}`
+		w := post(t, body)
+		require.Equal(t, http.StatusBadRequest, w.Code, body)
+
+		var response map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+		assert.Equal(t, "tick_micros", response["field"])
+		assert.NotEmpty(t, response["error"])
+		assert.NotContains(t, response, "message")
+	}
+}
+
+func TestDecodeInvalidTickTypeReturns400WithField(t *testing.T) {
+	w := post(t, `{"durations": [100], "tick_micros": 500.5}`)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "tick_micros", body["field"])
+}
+
+func TestDecodeScaledOutOfRangePulseReturns422WithOriginalIndex(t *testing.T) {
+	// Doubled clean values with the light-off gap at index 7 left at 100.
+	// At 500µs/tick it is 50,000µs, below the first 80,000µs gap window.
+	w := post(t, `{"tick_micros": 500, "durations": [200,200,200,200,200,600,200,100,200]}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(7), body["index"])
+	assert.NotContains(t, body, "message")
+}
+
+func TestDecodeMultiplicationOverflowReturns400(t *testing.T) {
+	if strconv.IntSize < 64 {
+		t.Skip("integer JSON values on this platform cannot reach 64-bit microsecond overflow")
+	}
+
+	body := `{"durations": [100, 9223372036854775807], "tick_micros": 1000}`
+	w := postRaw(t, body)
+	require.Equal(t, http.StatusBadRequest, w.Code)
+
+	var response map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response))
+	assert.Equal(t, "durations[1]", response["field"])
 }
 
 func TestDecodeInvalidPulseReturns422WithFirstIndex(t *testing.T) {
