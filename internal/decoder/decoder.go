@@ -63,6 +63,24 @@ var patterns = map[string]string{
 	"---": "O",
 }
 
+// Pulse roles recorded in the optional trace, after the strict light-on /
+// light-off alternation of the original durations array.
+const (
+	RoleLightOn  = "light_on"
+	RoleLightOff = "light_off"
+)
+
+// Per-pulse readings recorded in the optional trace. Both gap readings
+// describe light-off pulses: an intra-character gap keeps a character open,
+// while an inter-character gap only splits two characters and never becomes
+// part of a pattern.
+const (
+	ReadDot      = "dot"
+	ReadDash     = "dash"
+	ReadIntraGap = "intra_gap"
+	ReadInterGap = "inter_gap"
+)
+
 // CharSpan describes one decoded character and the inclusive range of
 // pulse indices (0-based, into the request's durations array) it covers.
 type CharSpan struct {
@@ -72,11 +90,25 @@ type CharSpan struct {
 	End     int    `json:"end"`
 }
 
+// TraceEntry is the on-site re-check record for one original duration: its
+// index in the request array, its light-on/light-off role, its length after
+// scaling to microseconds, and the reading that length was given.
+type TraceEntry struct {
+	Index  int    `json:"index"`
+	Role   string `json:"role"`
+	Micros int64  `json:"micros"`
+	Result string `json:"result"`
+}
+
 // Result is a fully decoded record: the message plus, for every character,
 // the pulse range it was decoded from, so the reading can be re-checked.
+// Trace is only populated by DecodeWithTrace and is omitted from JSON
+// otherwise, so responses without the diagnostic request field are
+// byte-for-byte shaped as before.
 type Result struct {
-	Message    string     `json:"message"`
-	Characters []CharSpan `json:"characters"`
+	Message    string       `json:"message"`
+	Characters []CharSpan   `json:"characters"`
+	Trace      []TraceEntry `json:"trace,omitempty"`
 }
 
 // Error pinpoints the first pulse that makes a record undecodable after
@@ -116,6 +148,21 @@ func (e *ScaleError) Error() string {
 // A *ScaleError is returned for an unsupported tick scale or integer
 // multiplication overflow, before a pulse can be classified as 422.
 func Decode(durations []int, tickMicros int) (*Result, error) {
+	return decode(durations, tickMicros, false)
+}
+
+// DecodeWithTrace behaves exactly like Decode but additionally fills
+// Result.Trace with one entry per original duration, in array order: the
+// original index, the light-on/light-off role, the scaled microsecond length
+// and the reading (dot, dash, intra-character gap or inter-character gap).
+// The trace is diagnostic only — inter-character gaps merely split
+// characters and are never appended to a pattern — so Message and
+// Characters stay identical to Decode's. No trace is produced on error.
+func DecodeWithTrace(durations []int, tickMicros int) (*Result, error) {
+	return decode(durations, tickMicros, true)
+}
+
+func decode(durations []int, tickMicros int, includeTrace bool) (*Result, error) {
 	if tickMicros < MinTickMicros || tickMicros > MaxTickMicros {
 		return nil, &ScaleError{
 			Field:  "tick_micros",
@@ -143,7 +190,29 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 		chars     []CharSpan
 		pattern   []byte
 		charStart int
+		trace     []TraceEntry
 	)
+	if includeTrace {
+		trace = make([]TraceEntry, 0, len(durations))
+	}
+
+	// recordTrace only grows the diagnostic trace; on any failure the
+	// partially built result is discarded, so it can never leak.
+	recordTrace := func(i int, micros int64, reading string) {
+		if !includeTrace {
+			return
+		}
+		role := RoleLightOn
+		if i%2 != 0 {
+			role = RoleLightOff
+		}
+		trace = append(trace, TraceEntry{
+			Index:  i,
+			Role:   role,
+			Micros: micros,
+			Result: reading,
+		})
+	}
 
 	closeChar := func(end int) *Error {
 		if len(pattern) == 0 {
@@ -173,11 +242,13 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 					charStart = i
 				}
 				pattern = append(pattern, '.')
+				recordTrace(i, micros, ReadDot)
 			case micros >= dashMinMicros && micros <= dashMaxMicros:
 				if len(pattern) == 0 {
 					charStart = i
 				}
 				pattern = append(pattern, '-')
+				recordTrace(i, micros, ReadDash)
 			default:
 				return nil, &Error{
 					Index: i,
@@ -193,7 +264,9 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 			switch {
 			case micros >= intraMinMicros && micros <= intraMaxMicros:
 				// Gap inside the current character: keep collecting.
+				recordTrace(i, micros, ReadIntraGap)
 			case micros >= interMinMicros && micros <= interMaxMicros:
+				recordTrace(i, micros, ReadInterGap)
 				if err := closeChar(i - 1); err != nil {
 					return nil, err
 				}
@@ -225,7 +298,7 @@ func Decode(durations []int, tickMicros int) (*Result, error) {
 	for _, c := range chars {
 		message = append(message, c.Char...)
 	}
-	return &Result{Message: string(message), Characters: chars}, nil
+	return &Result{Message: string(message), Characters: chars, Trace: trace}, nil
 }
 
 func scaleDuration(index, duration, tickMicros int) (int64, *ScaleError) {

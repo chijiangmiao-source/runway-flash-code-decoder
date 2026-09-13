@@ -128,6 +128,144 @@ func TestAcceptance500MicrosecondTicksDecodeSameMessage(t *testing.T) {
 	}
 }
 
+func TestAcceptanceDefaultResponseCarriesNoTrace(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// An old client that never sends include_trace must not gain any field.
+	status, body := postDurations(t, base, []int{100, 100, 300, 300, 300, 100, 100})
+	require.Equal(t, http.StatusOK, status, "body: %v", body)
+	assert.Equal(t, "AN", body["message"])
+	assert.Contains(t, body, "characters")
+	assert.NotContains(t, body, "trace")
+}
+
+func TestAcceptanceIncludeTraceFalseOmitsTrace(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	status, body := postDecode(t, base, map[string]any{
+		"durations":     []int{100, 100, 300},
+		"include_trace": false,
+	})
+	require.Equal(t, http.StatusOK, status, "body: %v", body)
+	assert.Equal(t, "A", body["message"])
+	assert.NotContains(t, body, "trace")
+}
+
+func TestAcceptanceIncludeTraceItemizesEveryPulse(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// "AN": dot, intra gap, dash, inter gap, dash, intra gap, dot — every
+	// pulse role and every one of the four readings appears.
+	durations := []int{100, 100, 300, 300, 300, 100, 100}
+	status, body := postDecode(t, base, map[string]any{
+		"durations":     durations,
+		"include_trace": true,
+	})
+	require.Equal(t, http.StatusOK, status, "body: %v", body)
+	assert.Equal(t, "AN", body["message"])
+
+	// characters keeps the exact same shape and values as without the flag.
+	chars, ok := body["characters"].([]any)
+	require.True(t, ok, "characters must be an array: %v", body)
+	require.Len(t, chars, 2)
+	first := chars[0].(map[string]any)
+	assert.Equal(t, "A", first["char"])
+	assert.Equal(t, ".-", first["pattern"])
+	assert.Equal(t, float64(0), first["start"])
+	assert.Equal(t, float64(2), first["end"])
+	second := chars[1].(map[string]any)
+	assert.Equal(t, "N", second["char"])
+	assert.Equal(t, float64(4), second["start"])
+	assert.Equal(t, float64(6), second["end"])
+
+	trace, ok := body["trace"].([]any)
+	require.True(t, ok, "trace must be an array: %v", body)
+	require.Len(t, trace, len(durations), "one trace entry per original pulse")
+
+	want := []struct {
+		index  float64
+		role   string
+		micros float64
+		result string
+	}{
+		{0, "light_on", 100_000, "dot"},
+		{1, "light_off", 100_000, "intra_gap"},
+		{2, "light_on", 300_000, "dash"},
+		{3, "light_off", 300_000, "inter_gap"},
+		{4, "light_on", 300_000, "dash"},
+		{5, "light_off", 100_000, "intra_gap"},
+		{6, "light_on", 100_000, "dot"},
+	}
+	for i, w := range want {
+		entry, ok := trace[i].(map[string]any)
+		require.True(t, ok, "trace entry %d: %v", i, trace[i])
+		assert.Equal(t, w.index, entry["index"], "trace %d index", i)
+		assert.Equal(t, w.role, entry["role"], "trace %d role", i)
+		assert.Equal(t, w.micros, entry["micros"], "trace %d micros", i)
+		assert.Equal(t, w.result, entry["result"], "trace %d result", i)
+	}
+}
+
+func TestAcceptanceIncludeTraceScaledMicros(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// Same A with 500µs ticks: the trace reports the converted microseconds.
+	status, body := postDecode(t, base, map[string]any{
+		"durations":     []int{160, 160, 480},
+		"tick_micros":   500,
+		"include_trace": true,
+	})
+	require.Equal(t, http.StatusOK, status, "body: %v", body)
+	assert.Equal(t, "A", body["message"])
+
+	trace := body["trace"].([]any)
+	require.Len(t, trace, 3)
+	first := trace[0].(map[string]any)
+	assert.Equal(t, float64(80_000), first["micros"])
+	assert.Equal(t, "dot", first["result"])
+	last := trace[2].(map[string]any)
+	assert.Equal(t, float64(240_000), last["micros"])
+	assert.Equal(t, "dash", last["result"])
+}
+
+func TestAcceptanceIncludeTraceRejectsNonBooleansWith400(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	for _, value := range []any{nil, "true", "false", 1, 0, 2.5, []any{}, map[string]any{}} {
+		status, body := postDecode(t, base, map[string]any{
+			"durations":     []int{100},
+			"include_trace": value,
+		})
+		assert.Equal(t, http.StatusBadRequest, status, "include_trace=%v body: %v", value, body)
+		assert.Equal(t, "include_trace", body["field"], "include_trace=%v", value)
+		assert.NotContains(t, body, "message", "include_trace=%v", value)
+		assert.NotContains(t, body, "trace", "include_trace=%v", value)
+	}
+}
+
+func TestAcceptanceIncludeTraceWithCorruptRecordStillReturns422(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	// A clean S, a clean character gap, then a 50ms light-off at index 7.
+	// The valid diagnostic flag must not alter the first-error 422.
+	status, body := postDecode(t, base, map[string]any{
+		"durations":     []int{100, 100, 100, 100, 100, 300, 100, 50, 100},
+		"include_trace": true,
+	})
+	require.Equal(t, http.StatusUnprocessableEntity, status, "body: %v", body)
+	assert.Equal(t, float64(7), body["index"])
+	assert.NotEmpty(t, body["error"])
+	assert.NotContains(t, body, "message", "corrupt records must not leak a partial message")
+	assert.NotContains(t, body, "characters", "corrupt records must not leak partial characters")
+	assert.NotContains(t, body, "trace", "corrupt records must not leak a partial trace")
+}
+
 func TestAcceptanceInvalidTickRejectedWith400(t *testing.T) {
 	base := apiURL(t)
 	waitForAPI(t, base)

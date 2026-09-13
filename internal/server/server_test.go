@@ -99,6 +99,154 @@ func TestDecodeInvalidTickReturns400WithField(t *testing.T) {
 	}
 }
 
+func TestDecodeDefaultResponseHasNoTrace(t *testing.T) {
+	// Clients that never send include_trace must receive a response shaped
+	// exactly field-for-field as before the diagnostic was added.
+	w := post(t, `{"durations": [100,100,100,100,100, 300, 300,100,300,100,300, 300, 100,100,100,100,100]}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Contains(t, body, "message")
+	assert.Contains(t, body, "characters")
+	assert.NotContains(t, body, "trace")
+}
+
+func TestDecodeIncludeTraceFalseOmitsTrace(t *testing.T) {
+	w := post(t, `{"durations": [100, 100, 300], "include_trace": false}`)
+	require.Equal(t, http.StatusOK, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "A", body["message"])
+	assert.NotContains(t, body, "trace")
+}
+
+func TestDecodeIncludeTraceTrue(t *testing.T) {
+	// "AN": a dot, an intra-character gap, a dash, then an inter-character
+	// gap, a dash, an intra-character gap and a dot — all four readings.
+	w := post(t, `{"durations": [100, 100, 300, 300, 300, 100, 100], "include_trace": true}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body struct {
+		Message    string `json:"message"`
+		Characters []struct {
+			Char    string `json:"char"`
+			Pattern string `json:"pattern"`
+			Start   int    `json:"start"`
+			End     int    `json:"end"`
+		} `json:"characters"`
+		Trace []struct {
+			Index  int    `json:"index"`
+			Micros int64  `json:"micros"`
+			Role   string `json:"role"`
+			Result string `json:"result"`
+		} `json:"trace"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, "AN", body.Message)
+	require.Len(t, body.Characters, 2)
+	assert.Equal(t, "A", body.Characters[0].Char)
+	assert.Equal(t, ".-", body.Characters[0].Pattern)
+	assert.Equal(t, 0, body.Characters[0].Start)
+	assert.Equal(t, 2, body.Characters[0].End)
+	assert.Equal(t, "N", body.Characters[1].Char)
+	assert.Equal(t, 4, body.Characters[1].Start)
+	assert.Equal(t, 6, body.Characters[1].End)
+
+	want := []struct {
+		index  int
+		role   string
+		micros int64
+		result string
+	}{
+		{0, "light_on", 100_000, "dot"},
+		{1, "light_off", 100_000, "intra_gap"},
+		{2, "light_on", 300_000, "dash"},
+		{3, "light_off", 300_000, "inter_gap"},
+		{4, "light_on", 300_000, "dash"},
+		{5, "light_off", 100_000, "intra_gap"},
+		{6, "light_on", 100_000, "dot"},
+	}
+	require.Len(t, body.Trace, len(want))
+	for i, e := range want {
+		assert.Equal(t, e.index, body.Trace[i].Index, "trace %d index", i)
+		assert.Equal(t, e.role, body.Trace[i].Role, "trace %d role", i)
+		assert.Equal(t, e.micros, body.Trace[i].Micros, "trace %d micros", i)
+		assert.Equal(t, e.result, body.Trace[i].Result, "trace %d result", i)
+	}
+}
+
+func TestDecodeIncludeTraceTrueWithScaledTicks(t *testing.T) {
+	// A at 500µs/tick: trace micros are the post-conversion values.
+	w := post(t, `{"tick_micros": 500, "durations": [160, 160, 480], "include_trace": true}`)
+	require.Equal(t, http.StatusOK, w.Code, w.Body.String())
+
+	var body struct {
+		Trace []struct {
+			Micros int64  `json:"micros"`
+			Result string `json:"result"`
+		} `json:"trace"`
+	}
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	require.Len(t, body.Trace, 3)
+	assert.Equal(t, int64(80_000), body.Trace[0].Micros)
+	assert.Equal(t, "dot", body.Trace[0].Result)
+	assert.Equal(t, int64(80_000), body.Trace[1].Micros)
+	assert.Equal(t, "intra_gap", body.Trace[1].Result)
+	assert.Equal(t, int64(240_000), body.Trace[2].Micros)
+	assert.Equal(t, "dash", body.Trace[2].Result)
+}
+
+func TestDecodeIncludeTraceCorruptRecordStillReturns422(t *testing.T) {
+	// A valid flag must not change failure semantics: the corrupt gap at
+	// index 7 still gives the original first-error 422 with no trace.
+	w := post(t, `{"durations": [100,100,100,100,100,300,100,50,100], "include_trace": true}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(7), body["index"])
+	assert.NotEmpty(t, body["error"])
+	assert.NotContains(t, body, "message")
+	assert.NotContains(t, body, "characters")
+	assert.NotContains(t, body, "trace")
+}
+
+func TestDecodeIncludeTraceUnmappedCharacterStillReturns422(t *testing.T) {
+	w := post(t, `{"durations": [100], "include_trace": true}`)
+	require.Equal(t, http.StatusUnprocessableEntity, w.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &body))
+	assert.Equal(t, float64(0), body["index"])
+	assert.NotContains(t, body, "trace")
+}
+
+func TestDecodeInvalidIncludeTraceTypeReturns400WithField(t *testing.T) {
+	for _, raw := range []string{
+		`null`,
+		`"true"`,
+		`"false"`,
+		`1`,
+		`0`,
+		`2.5`,
+		`[]`,
+		`{}`,
+	} {
+		body := `{"durations": [100], "include_trace": ` + raw + `}`
+		w := post(t, body)
+		require.Equal(t, http.StatusBadRequest, w.Code, "body: %s", body)
+
+		var response map[string]any
+		require.NoError(t, json.Unmarshal(w.Body.Bytes(), &response), "body: %s", body)
+		assert.Equal(t, "include_trace", response["field"], "body: %s", body)
+		assert.NotEmpty(t, response["error"], "body: %s", body)
+		assert.NotContains(t, response, "message", "body: %s", body)
+		assert.NotContains(t, response, "trace", "body: %s", body)
+	}
+}
+
 func TestDecodeInvalidTickTypeReturns400WithField(t *testing.T) {
 	w := post(t, `{"durations": [100], "tick_micros": 500.5}`)
 	require.Equal(t, http.StatusBadRequest, w.Code)

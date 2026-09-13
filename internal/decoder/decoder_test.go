@@ -190,6 +190,89 @@ func TestDecodeWithTickScale(t *testing.T) {
 	assert.Equal(t, defaultResult, scaledResult)
 }
 
+func TestDecodeWithTrace(t *testing.T) {
+	// SOS: dots and dashes, both intra-character and inter-character gaps.
+	durations := []int{
+		100, 100, 100, 100, 100, // S = ...
+		300,                     // character gap
+		300, 100, 300, 100, 300, // O = ---
+		300,                     // character gap
+		100, 100, 100, 100, 100, // S = ...
+	}
+
+	res, err := DecodeWithTrace(durations, DefaultTickMicros)
+	require.NoError(t, err)
+	require.NotNil(t, res)
+	assert.Equal(t, "SOS", res.Message)
+
+	want := []TraceEntry{
+		{Index: 0, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+		{Index: 1, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 2, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+		{Index: 3, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 4, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+		{Index: 5, Role: RoleLightOff, Micros: 300_000, Result: ReadInterGap},
+		{Index: 6, Role: RoleLightOn, Micros: 300_000, Result: ReadDash},
+		{Index: 7, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 8, Role: RoleLightOn, Micros: 300_000, Result: ReadDash},
+		{Index: 9, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 10, Role: RoleLightOn, Micros: 300_000, Result: ReadDash},
+		{Index: 11, Role: RoleLightOff, Micros: 300_000, Result: ReadInterGap},
+		{Index: 12, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+		{Index: 13, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 14, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+		{Index: 15, Role: RoleLightOff, Micros: 100_000, Result: ReadIntraGap},
+		{Index: 16, Role: RoleLightOn, Micros: 100_000, Result: ReadDot},
+	}
+	require.Len(t, res.Trace, len(durations))
+	for i, entry := range want {
+		assert.Equal(t, entry, res.Trace[i], "trace entry %d", i)
+	}
+}
+
+func TestDecodeWithoutTraceLeavesTraceNil(t *testing.T) {
+	res, err := Decode([]int{100, 100, 300}, DefaultTickMicros)
+	require.NoError(t, err)
+	assert.Nil(t, res.Trace)
+}
+
+func TestDecodeWithTraceMatchesPlainDecode(t *testing.T) {
+	durations := []int{
+		100, 100, 300, // A
+		300,
+		300, 100, 100, // N
+	}
+	plain, err := Decode(durations, DefaultTickMicros)
+	require.NoError(t, err)
+	traced, err := DecodeWithTrace(durations, DefaultTickMicros)
+	require.NoError(t, err)
+	assert.Equal(t, plain.Message, traced.Message)
+	assert.Equal(t, plain.Characters, traced.Characters)
+}
+
+func TestDecodeWithTraceUsesScaledMicroseconds(t *testing.T) {
+	// A at 500µs/tick: doubled ticks still read as dot/intra/dash.
+	res, err := DecodeWithTrace([]int{160, 160, 480}, 500)
+	require.NoError(t, err)
+	require.Len(t, res.Trace, 3)
+	assert.Equal(t, int64(80_000), res.Trace[0].Micros)
+	assert.Equal(t, ReadDot, res.Trace[0].Result)
+	assert.Equal(t, int64(80_000), res.Trace[1].Micros)
+	assert.Equal(t, ReadIntraGap, res.Trace[1].Result)
+	assert.Equal(t, int64(240_000), res.Trace[2].Micros)
+	assert.Equal(t, ReadDash, res.Trace[2].Result)
+}
+
+func TestDecodeWithTraceReturnsNothingOnError(t *testing.T) {
+	// Index 7 is a 50ms light-off gap: the same 422 as plain Decode, with no
+	// partial trace leaking the pulses that were classified before it.
+	res, err := DecodeWithTrace([]int{100, 100, 100, 100, 100, 300, 100, 50, 100}, DefaultTickMicros)
+	require.Nil(t, res)
+	var decErr *Error
+	require.ErrorAs(t, err, &decErr)
+	assert.Equal(t, 7, decErr.Index)
+}
+
 func TestDecodeInvalidScale(t *testing.T) {
 	for _, tickMicros := range []int{0, -1, MaxTickMicros + 1} {
 		t.Run(strconv.Itoa(tickMicros), func(t *testing.T) {

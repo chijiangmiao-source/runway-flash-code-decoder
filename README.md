@@ -18,6 +18,15 @@
 `end` 和错误 `index` 始终是原始 `durations` 数组下标。`tick_micros` 必须位于
 1–1,000,000（含端点）；乘法发生整数溢出时，请求同样失败且不会产生部分结果。
 
+可选布尔字段 `include_trace` 缺省为 `false`。设为 `true` 且解码成功时，响应额外携带
+`trace`：判读核心按原始数组顺序为每个时长生成一项，给出原始下标、亮灭角色
+（`light_on` / `light_off`）、换算后的微秒值和判读结果
+（`dot` / `dash` / `intra_gap` / `inter_gap`）。`inter_gap` 只负责切字，不进入任何
+字符的 `pattern`；`characters` 与 `message` 的结构和值与不传该字段时完全一致。
+`include_trace` 只接受 JSON 布尔值；`null`、字符串、数字（包括 `1`/`0`）一律以
+`400` 指向 `include_trace`。解码失败时仍是原有的首错 `422`，不会夹带 `trace` 或
+部分报码。
+
 ## 判读规则（全部为闭区间，端点有效）
 
 | 脉冲 | 含义 | 合法窗口（含端点） |
@@ -65,6 +74,43 @@ curl -X POST "http://localhost:${API_PORT:-8080}/decode" \
 }
 ```
 
+### 现场复核诊断（`include_trace`）
+
+现场复核报码时需要逐个原始脉冲核对其换算后的归属，在请求中加上
+`"include_trace": true`：
+
+```bash
+curl -X POST "http://localhost:${API_PORT:-8080}/decode" \
+  -H 'Content-Type: application/json' \
+  -d '{"durations": [100,100,300, 300, 300,100,100], "include_trace": true}'
+```
+
+`message` 与 `characters` 与不传该字段时逐字段一致，响应额外给出按原始数组顺序
+排列的 `trace`，可与下标逐项对照（上例解出 `AN`）：
+
+```json
+{
+  "message": "AN",
+  "characters": [
+    {"char": "A", "pattern": ".-", "start": 0, "end": 2},
+    {"char": "N", "pattern": "-.", "start": 4, "end": 6}
+  ],
+  "trace": [
+    {"index": 0, "role": "light_on",  "micros": 100000, "result": "dot"},
+    {"index": 1, "role": "light_off", "micros": 100000, "result": "intra_gap"},
+    {"index": 2, "role": "light_on",  "micros": 300000, "result": "dash"},
+    {"index": 3, "role": "light_off", "micros": 300000, "result": "inter_gap"},
+    {"index": 4, "role": "light_on",  "micros": 300000, "result": "dash"},
+    {"index": 5, "role": "light_off", "micros": 100000, "result": "intra_gap"},
+    {"index": 6, "role": "light_on",  "micros": 100000, "result": "dot"}
+  ]
+}
+```
+
+`micros` 是 `durations[index] × tick_micros` 的换算结果；`inter_gap`（字间间隔）
+只负责切字，因此不出现在任何字符的 `pattern` 里。`include_trace: false` 或不传该
+字段时响应中不含 `trace` 键。
+
 ## 错误语义
 
 - `422 Unprocessable Entity`：按 `tick_micros` 整数换算后，任一脉冲非法（非正整数、亮/灭时长落在窗口之外、记录以灭灯结尾）或字符不在映射表。
@@ -76,7 +122,8 @@ curl -X POST "http://localhost:${API_PORT:-8080}/decode" \
   ```
 
 - `400 Bad Request`：请求体不是合法 JSON，`durations` 不是整数数组（如含小数、字符串），
-  `tick_micros` 不是整数或不在 1–1,000,000 闭区间内，或 `durations[i] × tick_micros`
+  `tick_micros` 不是整数或不在 1–1,000,000 闭区间内，`include_trace` 不是布尔值
+  （`null`、字符串、数字等），或 `durations[i] × tick_micros`
   发生整数乘法溢出。响应通过 `field` 指出字段；数组元素溢出时字段形如
   `durations[3]`：
 

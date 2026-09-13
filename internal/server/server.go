@@ -14,12 +14,14 @@ import (
 
 // decodeRequest is the JSON body of POST /decode: the alternating
 // light-on/light-off pulse durations, plus the optional integer-microsecond
-// size of one duration tick. Both members are captured raw so an explicit
-// JSON null can be told apart from an omitted member: null is a type error,
-// while an omitted member keeps its default handling.
+// size of one duration tick and the optional include_trace diagnostic flag.
+// Every member is captured raw so an explicit JSON null can be told apart
+// from an omitted member: null is a type error, while an omitted member
+// keeps its default handling.
 type decodeRequest struct {
-	Durations  json.RawMessage `json:"durations"`
-	TickMicros json.RawMessage `json:"tick_micros"`
+	Durations    json.RawMessage `json:"durations"`
+	TickMicros   json.RawMessage `json:"tick_micros"`
+	IncludeTrace json.RawMessage `json:"include_trace"`
 }
 
 // New builds the Gin engine with every route registered.
@@ -38,7 +40,7 @@ func decode(c *gin.Context) {
 	var req decodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response := gin.H{
-			"error": "request body must be a JSON object like {\"durations\": [100, 100, 300], \"tick_micros\": 1000}",
+			"error": "request body must be a JSON object like {\"durations\": [100, 100, 300], \"tick_micros\": 1000, \"include_trace\": false}",
 		}
 
 		var typeErr *json.UnmarshalTypeError
@@ -60,8 +62,18 @@ func decode(c *gin.Context) {
 	if !ok {
 		return
 	}
+	includeTrace, ok := parseIncludeTrace(c, req.IncludeTrace)
+	if !ok {
+		return
+	}
 
-	result, err := decoder.Decode(durations, tickMicros)
+	// The diagnostic trace never changes the reading itself; on failure the
+	// same first-error 422 is returned with no trace or partial message.
+	decodeFn := decoder.Decode
+	if includeTrace {
+		decodeFn = decoder.DecodeWithTrace
+	}
+	result, err := decodeFn(durations, tickMicros)
 	var scaleErr *decoder.ScaleError
 	if errors.As(err, &scaleErr) {
 		c.JSON(http.StatusBadRequest, gin.H{
@@ -148,9 +160,40 @@ func parseTickMicros(c *gin.Context, raw json.RawMessage) (int, bool) {
 	return tickMicros, true
 }
 
+// parseIncludeTrace decodes the optional raw include_trace member,
+// defaulting an omitted member to false. The flag is strictly boolean: an
+// explicit JSON null, a string or a number are all rejected with field
+// include_trace rather than coerced (in particular 1/0 are not booleans).
+// It reports whether the field is usable, having written the 400 response
+// itself when it is not.
+func parseIncludeTrace(c *gin.Context, raw json.RawMessage) (bool, bool) {
+	if raw == nil {
+		return false, true
+	}
+	if string(raw) == "null" {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "include_trace",
+			"error": "include_trace must be a boolean, got null",
+		})
+		return false, false
+	}
+	var includeTrace bool
+	if err := json.Unmarshal(raw, &includeTrace); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{
+			"field": "include_trace",
+			"error": "include_trace has an invalid JSON type: include_trace must be a boolean",
+		})
+		return false, false
+	}
+	return includeTrace, true
+}
+
 func jsonFieldName(field string) string {
-	if field == "tick_micros" {
+	switch field {
+	case "tick_micros":
 		return "tick_micros"
+	case "include_trace":
+		return "include_trace"
 	}
 	// Field paths for array elements begin with the JSON field name.
 	return "durations"
