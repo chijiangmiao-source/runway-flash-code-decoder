@@ -6,10 +6,12 @@ import (
 	"errors"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 
 	"morse-api/internal/decoder"
+	"morse-api/internal/stats"
 )
 
 // decodeRequest is the JSON body of POST /decode: the alternating
@@ -29,14 +31,26 @@ func New() *gin.Engine {
 	r := gin.New()
 	r.Use(gin.Logger(), gin.Recovery())
 
+	// The decode tally lives as long as the process: it starts empty, is
+	// never persisted, and holds counters only — never any pulse data.
+	recorder := stats.NewRecorder(time.Now())
+
 	r.GET("/healthz", func(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "ok"})
 	})
-	r.POST("/decode", decode)
+	r.POST("/decode", func(c *gin.Context) { decode(c, recorder) })
+	r.GET("/stats", func(c *gin.Context) {
+		c.JSON(http.StatusOK, recorder.Snapshot())
+	})
 	return r
 }
 
-func decode(c *gin.Context) {
+func decode(c *gin.Context, recorder *stats.Recorder) {
+	// Every completed decode is tallied exactly once, by the final status
+	// the chain below produced. The response is already written when this
+	// deferred call runs, so recording can never change the outcome.
+	defer func() { recorder.Record(classify(c.Writer.Status())) }()
+
 	var req decodeRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
 		response := gin.H{
@@ -186,6 +200,21 @@ func parseIncludeTrace(c *gin.Context, raw json.RawMessage) (bool, bool) {
 		return false, false
 	}
 	return includeTrace, true
+}
+
+// classify maps the final HTTP status of a completed POST /decode request
+// to its tally category: 2xx is a success, 400 a malformed request and 422
+// an undecodable record. The decode chain only ever answers those statuses,
+// so every completed request lands in exactly one category.
+func classify(status int) stats.Category {
+	switch {
+	case status >= 200 && status < 300:
+		return stats.CategorySuccess
+	case status == http.StatusBadRequest:
+		return stats.CategoryBadRequest
+	default:
+		return stats.CategoryUndecodable
+	}
 }
 
 func jsonFieldName(field string) string {

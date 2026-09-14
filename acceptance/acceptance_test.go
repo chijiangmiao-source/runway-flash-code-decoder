@@ -8,9 +8,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"math"
 	"net/http"
 	"os"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -58,6 +61,183 @@ func postDecode(t *testing.T, base string, payload map[string]any) (int, map[str
 func postDurations(t *testing.T, base string, durations []int) (int, map[string]any) {
 	t.Helper()
 	return postDecode(t, base, map[string]any{"durations": durations})
+}
+
+// statsSnapshot mirrors the GET /stats response.
+type statsSnapshot struct {
+	StartedAt   string `json:"started_at"`
+	Total       int64  `json:"total"`
+	Success     int64  `json:"success"`
+	BadRequest  int64  `json:"bad_request"`
+	Undecodable int64  `json:"undecodable"`
+}
+
+func getStats(t *testing.T, base string) statsSnapshot {
+	t.Helper()
+	resp, err := http.Get(base + "/stats")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+	var snap statsSnapshot
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&snap))
+	return snap
+}
+
+// postRawDecode posts a raw body, so malformed JSON can be exercised too.
+func postRawDecode(t *testing.T, base, raw string) (int, map[string]any) {
+	t.Helper()
+	resp, err := http.Post(base+"/decode", "application/json", strings.NewReader(raw))
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	var body map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&body))
+	return resp.StatusCode, body
+}
+
+// postDecodeStatus is the goroutine-safe variant used by the concurrency
+// check: it never calls require, which must stay on the test goroutine.
+func postDecodeStatus(base, raw string) (int, error) {
+	resp, err := http.Post(base+"/decode", "application/json", strings.NewReader(raw))
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+	return resp.StatusCode, nil
+}
+
+// The stats checks must stay ahead of every decode-posting acceptance test:
+// the api container is a fresh process for each verify run, so only the
+// first tests to run observe the zero baseline. Go runs tests in source
+// order within the file.
+
+func TestAcceptanceStatsStartAtZero(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+
+	resp, err := http.Get(base + "/stats")
+	require.NoError(t, err)
+	defer resp.Body.Close()
+	require.Equal(t, http.StatusOK, resp.StatusCode)
+
+	// The complete zero-value structure is returned even before the first
+	// decode request.
+	var raw map[string]any
+	require.NoError(t, json.NewDecoder(resp.Body).Decode(&raw))
+	for _, key := range []string{"started_at", "total", "success", "bad_request", "undecodable"} {
+		assert.Contains(t, raw, key)
+	}
+	assert.EqualValues(t, 0, raw["total"])
+	assert.EqualValues(t, 0, raw["success"])
+	assert.EqualValues(t, 0, raw["bad_request"])
+	assert.EqualValues(t, 0, raw["undecodable"])
+
+	startedAt, err := time.Parse(time.RFC3339, raw["started_at"].(string))
+	require.NoError(t, err, "started_at must be an RFC 3339 timestamp")
+	assert.False(t, startedAt.After(time.Now()), "started_at must not be in the future")
+}
+
+func TestAcceptanceStatsCountEachOutcomeExactly(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+	before := getStats(t, base)
+
+	// One success.
+	status, _ := postDurations(t, base, []int{100, 100, 300})
+	require.Equal(t, http.StatusOK, status)
+	// Two bad requests: malformed JSON and a field type error.
+	status, _ = postRawDecode(t, base, `not json`)
+	require.Equal(t, http.StatusBadRequest, status)
+	status, _ = postDecode(t, base, map[string]any{"durations": "100,100"})
+	require.Equal(t, http.StatusBadRequest, status)
+	// One undecodable record.
+	status, _ = postDurations(t, base, []int{100, 100, 100})
+	require.Equal(t, http.StatusUnprocessableEntity, status)
+
+	after := getStats(t, base)
+	assert.Equal(t, before.Success+1, after.Success)
+	assert.Equal(t, before.BadRequest+2, after.BadRequest)
+	assert.Equal(t, before.Undecodable+1, after.Undecodable)
+	assert.Equal(t, before.Total+4, after.Total)
+	assert.Equal(t, before.StartedAt, after.StartedAt,
+		"started_at marks process start and never moves")
+}
+
+func TestAcceptanceStatsIgnoreHealthAndUnknownRoutes(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+	// The stats query itself must not be tallied either.
+	before := getStats(t, base)
+
+	for i := 0; i < 3; i++ {
+		resp, err := http.Get(base + "/healthz")
+		require.NoError(t, err)
+		resp.Body.Close()
+		require.Equal(t, http.StatusOK, resp.StatusCode)
+	}
+	resp, err := http.Get(base + "/no-such-route")
+	require.NoError(t, err)
+	resp.Body.Close()
+	require.Equal(t, http.StatusNotFound, resp.StatusCode)
+
+	after := getStats(t, base)
+	assert.Equal(t, before, after)
+}
+
+func TestAcceptanceStatsConcurrentMixedRequests(t *testing.T) {
+	base := apiURL(t)
+	waitForAPI(t, base)
+	before := getStats(t, base)
+
+	const workers = 16
+	statuses := make(chan int, 3*workers)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for _, raw := range []string{
+				`{"durations":[100,100,300]}`, // success
+				`{"durations":"100,100"}`,     // bad request
+				`{"durations":[100,100,100]}`, // undecodable
+			} {
+				status, err := postDecodeStatus(base, raw)
+				if err != nil {
+					status = 0
+				}
+				statuses <- status
+			}
+		}()
+	}
+	wg.Wait()
+	close(statuses)
+
+	var got200, got400, got422, gotOther int
+	for status := range statuses {
+		switch status {
+		case http.StatusOK:
+			got200++
+		case http.StatusBadRequest:
+			got400++
+		case http.StatusUnprocessableEntity:
+			got422++
+		default:
+			gotOther++
+		}
+	}
+	require.Equal(t, workers, got200)
+	require.Equal(t, workers, got400)
+	require.Equal(t, workers, got422)
+	require.Zero(t, gotOther)
+
+	// No missed or double counting: every request was tallied exactly once
+	// and the total is exactly the sum of the three categories.
+	after := getStats(t, base)
+	assert.Equal(t, before.Success+workers, after.Success)
+	assert.Equal(t, before.BadRequest+workers, after.BadRequest)
+	assert.Equal(t, before.Undecodable+workers, after.Undecodable)
+	assert.Equal(t, before.Total+3*workers, after.Total)
+	assert.Equal(t, after.Success+after.BadRequest+after.Undecodable, after.Total)
 }
 
 func TestAcceptanceValidRecordDecodesUniquely(t *testing.T) {

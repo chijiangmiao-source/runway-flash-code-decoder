@@ -131,7 +131,39 @@ curl -X POST "http://localhost:${API_PORT:-8080}/decode" \
   {"field": "tick_micros", "error": "tick_micros must be between 1 and 1000000 microseconds, got 0"}
   ```
 
-另提供 `GET /healthz` 健康检查。
+另提供 `GET /healthz` 健康检查与 `GET /stats` 解码统计（见下节）。
+
+## 解码统计（GET /stats）
+
+值班负责人在一轮巡检后可查看本进程启动以来的解码概况：
+
+```bash
+curl "http://localhost:${API_PORT:-8080}/stats"
+```
+
+```json
+{
+  "started_at": "2026-09-14T01:23:45Z",
+  "total": 12,
+  "success": 9,
+  "bad_request": 2,
+  "undecodable": 1
+}
+```
+
+统计口径：
+
+- 每次 `POST /decode` 完成时按最终结果**只记一次**：`2xx` 计入 `success`，`400`
+  计入 `bad_request`（非法 JSON、字段类型错误、`tick_micros` 越界、乘法溢出），
+  `422` 计入 `undecodable`（记录无法判读）；`total` 为三类之和。分类完全由现有
+  解码链路产生的最终状态码决定。
+- `GET /healthz`、`GET /stats` 本身以及未知路由不参与累计。
+- 统计只保存启动时间与计数，**不保存、也不暴露任何脉冲原文**；统计在响应写出后
+  才记账，其自身的任何异常都不会改变解码结果。
+
+生命周期：计数为**进程级**，自服务启动（`started_at`，UTC，秒精度）开始累计，
+进程重启后从零开始，不做持久化；尚无请求时也返回完整的零值结构。计数并发安全，
+读取时所有字段来自同一快照，因此任意时刻 `total` 恒等于三类计数之和。
 
 ## 运行
 
@@ -156,6 +188,7 @@ go build -o api . && ./api
 ```
 main.go                     入口（LISTEN_ADDR 可覆盖监听地址，默认 :8080）
 internal/decoder/           判读核心：整数刻度换算、闭区间窗口、映射表、首个异常定位
-internal/server/            Gin 路由与错误映射（200 / 422 / 400）
+internal/server/            Gin 路由与错误映射（200 / 422 / 400）、GET /stats 接线
+internal/stats/             进程级解码结果计数（并发安全、仅内存、重启清零）
 acceptance/                 verify 服务执行的黑盒验收测试
 ```
